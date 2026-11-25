@@ -1,0 +1,56 @@
+# Build output
+/build/
+/build-*/
+/dist/
+/out/
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.tlog
+*.recipe
+
+# Keys, credentials, runtime data
+*.key
+*.pem
+*.pfx
+*.p12
+private.key
+public.key
+ds2net_rsa.pub
+local.env.bat
+.env
+.env.*
+**/Saved/
+*.sqlite
+*.time
+
+# Logs and dumps
+*.log
+*.dmp
+
+# Archives and game/emulator artifacts
+*.zip
+*.7z
+*.rar
+*.tar.gz
+steam_api.ini
+steam_api64_org.dll
+steam_appid.txt
+ds2net.ini
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+nul

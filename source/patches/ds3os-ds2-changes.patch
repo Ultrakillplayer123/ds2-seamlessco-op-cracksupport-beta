@@ -1,0 +1,492 @@
+﻿diff --git a/Source/Server.DarkSouls2/Server/GameService/GameManagers/Boot/DS2_BootManager.cpp b/Source/Server.DarkSouls2/Server/GameService/GameManagers/Boot/DS2_BootManager.cpp
+index 0b2ce3c6..041e3ec4 100644
+--- a/Source/Server.DarkSouls2/Server/GameService/GameManagers/Boot/DS2_BootManager.cpp
++++ b/Source/Server.DarkSouls2/Server/GameService/GameManagers/Boot/DS2_BootManager.cpp
+@@ -78,6 +78,21 @@ MessageHandleResult DS2_BootManager::Handle_RequestWaitForUserLogin(GameClient*
+ 
+     State.SetPlayerId(NewPlayerId);
+ 
++    // SEAMLESS PATCH: the same player logging in while an older connection of
++    // theirs is still listed means that older game is gone -- crashed or killed.
++    // Its connection lingers until retransmission gives up (about a minute), and
++    // meanwhile its signs stay on offer and a summon pushed to the player can land
++    // on it (12.09 01:25: ee restarted after a crash and could not be summoned).
++    // Drop it now; OnLostPlayer takes its signs with it.
++    std::shared_ptr<GameService> OwnerService = ServerInstance->GetService<GameService>();
++    for (const std::shared_ptr<GameClient>& Stale : OwnerService->FindClients([Client, NewPlayerId](const std::shared_ptr<GameClient>& Other) {
++             return Other.get() != Client && Other->GetPlayerState().GetPlayerId() == NewPlayerId;
++         }))
++    {
++        WarningS(Stale->GetName().c_str(), "[SEAMLESS] Player %u logged in again on a new connection, dropping this old one.", NewPlayerId);
++        Stale->DisconnectTime = GetSeconds();
++    }
++
+     LogS(Client->GetName().c_str(), "Steam id '%s' has logged in as player %i.", State.GetSteamId().c_str(), State.GetPlayerId());
+     LogS(Client->GetName().c_str(), "Renaming connection to '%s'.", State.GetSteamId().c_str());
+ 
+diff --git a/Source/Server.DarkSouls2/Server/GameService/GameManagers/Signs/DS2_SignManager.cpp b/Source/Server.DarkSouls2/Server/GameService/GameManagers/Signs/DS2_SignManager.cpp
+index 1ff375f3..f888fd40 100644
+--- a/Source/Server.DarkSouls2/Server/GameService/GameManagers/Signs/DS2_SignManager.cpp
++++ b/Source/Server.DarkSouls2/Server/GameService/GameManagers/Signs/DS2_SignManager.cpp
+@@ -164,10 +164,36 @@ MessageHandleResult DS2_SignManager::Handle_RequestGetSignList(GameClient* Clien
+ 
+     int RemainingSignCount = (int)Request->max_signs();
+ 
++    // SEAMLESS PATCH: a client standing somewhere summoning is not allowed asks
++    // for no areas at all, and every gather below lives inside this loop, so
++    // such a client was handed an empty list every time. That is what "nothing
++    // appears under my feet in Majula" looked like from the server's side ΓÇö the
++    // cross-area code never even ran. One synthetic pass keeps those clients in
++    // the game.
++    const bool NoSearchAreas = (Request->search_areas_size() == 0);
++    const int PassCount = NoSearchAreas ? 1 : Request->search_areas_size();
++
++    // Every sign goes out at most once per request.
++    //
++    // A client asks about twenty or forty cells at a time, and the foreign-sign
++    // gather below used to keep its "already taken" set inside the per-cell
++    // loop, so the same sign was added again for every cell ΓÇö one sign came back
++    // as forty copies with forty different cell ids, in a response of three
++    // kilobytes. Whatever the client makes of that, it stopped showing the sign
++    // at all, which is what looked like cross-area summoning breaking by itself.
++    std::unordered_set<uint32_t> OfferedThisRequest;
++
+     // Grab as many recent signs as we can from the cache that match our matching criteria.
+-    for (int i = 0; i < Request->search_areas_size() && RemainingSignCount > 0; i++)
++    for (int i = 0; i < PassCount && RemainingSignCount > 0; i++)
+     {
+-        const DS2_Frpg2RequestMessage::SignCellInfo& Area = Request->search_areas(i);
++        DS2_Frpg2RequestMessage::SignCellInfo SyntheticArea;
++        if (NoSearchAreas)
++        {
++            SyntheticArea.set_cell_id(0);
++            SyntheticArea.set_max_signs(RemainingSignCount);
++        }
++        const DS2_Frpg2RequestMessage::SignCellInfo& Area =
++            NoSearchAreas ? SyntheticArea : Request->search_areas(i);
+ 
+         // Grab list of signs the client already has.
+         std::unordered_set<uint32_t> ClientExistingSignId;
+@@ -181,13 +207,63 @@ MessageHandleResult DS2_SignManager::Handle_RequestGetSignList(GameClient* Clien
+ 
+         DS2_CellAndAreaId LocationId = { Area.cell_id(), (DS2_OnlineAreaId)Request->online_area_id() };
+ 
+-        std::vector<std::shared_ptr<SummonSign>> AreaSigns = LiveCache.GetRecentSet(LocationId, GatherCount, [this, &Player, &Request](const std::shared_ptr<SummonSign>& Sign) { 
++        auto PassesMatching = [this, &Request](const std::shared_ptr<SummonSign>& Sign) {
+             return CanMatchWith(
+-                Request->matching_parameter(), 
+-                static_cast<DS2_Frpg2RequestMessage::MatchingParameter&>(*Sign->MatchingParameters.get()), 
++                Request->matching_parameter(),
++                static_cast<DS2_Frpg2RequestMessage::MatchingParameter&>(*Sign->MatchingParameters.get()),
+                 Sign->Type
+             );
+-        });
++        };
++
++        std::vector<std::shared_ptr<SummonSign>> AreaSigns = LiveCache.GetRecentSet(LocationId, GatherCount, PassesMatching);
++
++        // SEAMLESS PATCH: signs from every other area are offered here too, so a
++        // guest can drop a sign wherever they happen to be and still be summoned
++        // by a host standing somewhere else entirely. Vanilla only ever looks in
++        // LocationId, which forces both players into the same area first.
++        //
++        // The signs are handed back re-labelled with the host's own area/cell
++        // (see below), otherwise the host's client discards them. The matching
++        // rules (CanMatchWith) still apply, and a player never sees their own sign.
++        // Anything already handed out in an earlier cell of this same request is
++        // not offered again.
++        for (auto It = AreaSigns.begin(); It != AreaSigns.end(); )
++        {
++            It = (OfferedThisRequest.count((*It)->SignId) > 0) ? AreaSigns.erase(It) : It + 1;
++        }
++
++        if ((int)AreaSigns.size() < GatherCount)
++        {
++            std::unordered_set<uint32_t>& AlreadyGathered = OfferedThisRequest;
++            for (auto& Sign : AreaSigns)
++            {
++                AlreadyGathered.insert(Sign->SignId);
++            }
++
++            std::vector<std::shared_ptr<SummonSign>> ForeignSigns = LiveCache.GetRandomSet(GatherCount * 8, [](DS2_CellAndAreaId Id) { return true; });
++            for (auto& Sign : ForeignSigns)
++            {
++                if ((int)AreaSigns.size() >= GatherCount)
++                {
++                    break;
++                }
++                if (AlreadyGathered.count(Sign->SignId) > 0 || Sign->PlayerId == Player.GetPlayerId())
++                {
++                    continue;
++                }
++                if (!PassesMatching(Sign))
++                {
++                    continue;
++                }
++
++                AreaSigns.push_back(Sign);
++                AlreadyGathered.insert(Sign->SignId);
++
++                LogS(Client->GetName().c_str(), "[SEAMLESS] Offering foreign sign %i (area %i cell %llu) as area %i cell %llu.",
++                    Sign->SignId, (int)Sign->OnlineAreaId, (unsigned long long)Sign->CellId,
++                    (int)Request->online_area_id(), (unsigned long long)Area.cell_id());
++            }
++        }
+ 
+         for (std::shared_ptr<SummonSign>& Sign : AreaSigns)
+         {
+@@ -203,16 +279,21 @@ MessageHandleResult DS2_SignManager::Handle_RequestGetSignList(GameClient* Clien
+                 DS2_Frpg2RequestMessage::SignData* SignData = Response.add_sign_data();
+                 SignData->mutable_sign_info()->set_player_id(Sign->PlayerId);
+                 SignData->mutable_sign_info()->set_sign_id(Sign->SignId);
+-                SignData->set_online_area_id((uint32_t)Sign->OnlineAreaId);
++                // SEAMLESS PATCH: report every sign as belonging to the area the
++                // host is actually standing in. A sign labelled with its own
++                // (foreign) area is thrown away by the host's client, so signs
++                // gathered from other areas above would never show up.
++                SignData->set_online_area_id((uint32_t)Request->online_area_id());
+                 SignData->mutable_matching_parameter()->CopyFrom(static_cast<DS2_Frpg2RequestMessage::MatchingParameter&>(*Sign->MatchingParameters));
+                 SignData->set_player_struct(Sign->PlayerStruct.data(), Sign->PlayerStruct.size());
+                 SignData->set_player_steam_id(Sign->PlayerSteamId);
+-                SignData->set_cell_id(Sign->CellId);
++                SignData->set_cell_id(Area.cell_id());
+                 SignData->set_sign_type((DS2_Frpg2RequestMessage::SignType)Sign->Type);
+             }
+ 
+             // Make sure user is marked as aware of the sign so we can clear up when the sign is removed.
+             Sign->AwarePlayerIds.insert(Player.GetPlayerId());
++            OfferedThisRequest.insert(Sign->SignId);
+ 
+             RemainingSignCount--;
+             if (RemainingSignCount <= 0)
+@@ -391,6 +472,57 @@ MessageHandleResult DS2_SignManager::Handle_RequestSummonSign(GameClient* Client
+ 
+     // First check the sign still exists, if it doesn't, send a reject message as its probably already used.
+     std::shared_ptr<SummonSign> Sign = LiveCache.Find(LocationId, Request->sign_info().sign_id());
++
++    // SEAMLESS PATCH: Handle_RequestGetSignList hands foreign signs to the host
++    // re-labelled with the host's own area, so the host summons them using that
++    // area ΓÇö which is not where the sign is actually cached. Fall back to a
++    // search across every area by sign id before declaring the sign dead.
++    if (!Sign)
++    {
++        std::vector<std::shared_ptr<SummonSign>> AllSigns = LiveCache.GetRandomSet(0x7FFFFFFF, [](DS2_CellAndAreaId Id) { return true; });
++
++        std::string CacheDump;
++        for (auto& Candidate : AllSigns)
++        {
++            CacheDump += StringFormat("%i(area %i) ", Candidate->SignId, (int)Candidate->OnlineAreaId);
++
++            if (Candidate->SignId == Request->sign_info().sign_id())
++            {
++                Sign = Candidate;
++                LocationId = { Candidate->CellId, (DS2_OnlineAreaId)Candidate->OnlineAreaId };
++            }
++        }
++
++        LogS(Client->GetName().c_str(), "[SEAMLESS] Sign %i not in requested area (%i cell %llu). Cross-area lookup over %zu cached signs [%s] -> %s.",
++            Request->sign_info().sign_id(), (int)Request->online_area_id(), (unsigned long long)Request->cell_id(),
++            AllSigns.size(), CacheDump.c_str(), Sign ? "FOUND" : "NOT FOUND");
++    }
++
++    // SEAMLESS PATCH: a sign that is gone may be the old sign of a player whose
++    // game restarted -- they have placed a new one, but the host still holds
++    // the old id (its mod blocks PushRequestRemoveSign mid-session) and the
++    // automatic summon can pick it. The host means that player, not that sign:
++    // summon their current one. A rejection would be blocked on the host just
++    // the same, and its game would wait on a summon that never comes.
++    if (!Sign && Request->sign_info().player_id() != 0)
++    {
++        const uint32_t OwnerId = Request->sign_info().player_id();
++        for (auto& Candidate : LiveCache.GetRandomSet(0x7FFFFFFF, [](DS2_CellAndAreaId Id) { return true; }))
++        {
++            if (Candidate->PlayerId == OwnerId && Candidate->BeingSummonedByPlayerId == 0 &&
++                (!Sign || Candidate->SignId > Sign->SignId))
++            {
++                Sign = Candidate;
++            }
++        }
++        if (Sign)
++        {
++            LocationId = { Sign->CellId, (DS2_OnlineAreaId)Sign->OnlineAreaId };
++            LogS(Client->GetName().c_str(), "[SEAMLESS] Sign %i is gone; player %u's current sign is %i -- summoning that one instead.",
++                Request->sign_info().sign_id(), OwnerId, Sign->SignId);
++        }
++    }
++
+     if (!Sign)
+     {
+         WarningS(Client->GetName().c_str(), "Client attempted to use invalid summon sign, sending back rejection, %i.", Request->sign_info().sign_id());
+@@ -474,16 +606,35 @@ MessageHandleResult DS2_SignManager::Handle_RequestRejectSign(GameClient* Client
+ 
+     DS2_CellAndAreaId LocationId = { (uint64_t)Request->cell_id(), (DS2_OnlineAreaId)Request->online_area_id() };
+ 
+-    // First check the sign still exists, if it doesn't, send a reject message as its probably already used.
++    // First check the sign still exists.
+     std::shared_ptr<SummonSign> Sign = LiveCache.Find(LocationId, Request->sign_id());
++
++    // SEAMLESS PATCH: signs are cached in the area they were re-labelled into
++    // (the host's), while the rejecting client reports its own location. Look
++    // the sign up by id across every area, as Handle_RequestSummonSign does.
+     if (!Sign)
+     {
+-        WarningS(Client->GetName().c_str(), "Client attempted to reject summoning for invalid sign (or sign cancelled), %i.", Request->sign_id());
+-        return MessageHandleResult::Handled;
++        std::vector<std::shared_ptr<SummonSign>> AllSigns = LiveCache.GetRandomSet(0x7FFFFFFF, [](DS2_CellAndAreaId Id) { return true; });
++        for (auto& Candidate : AllSigns)
++        {
++            if (Candidate->SignId == Request->sign_id())
++            {
++                Sign = Candidate;
++                break;
++            }
++        }
+     }
+ 
++    // SEAMLESS PATCH: the response below goes out whatever happens. Returning
++    // without it left the client waiting on this request forever, and every
++    // request after it -- the next sign creation included -- went unanswered
++    // until the client dropped to offline ("lost connection to the game server").
++    if (!Sign)
++    {
++        WarningS(Client->GetName().c_str(), "Client attempted to reject summoning for invalid sign (or sign cancelled), %i.", Request->sign_id());
++    }
+     // Send PushRequestRejectSign response to whichever client attempted to summon them.
+-    if (Sign->BeingSummonedByPlayerId != 0)
++    else if (Sign->BeingSummonedByPlayerId != 0)
+     {
+         if (std::shared_ptr<GameClient> OtherClient = GameServiceInstance->FindClientByPlayerId(Sign->BeingSummonedByPlayerId))
+         {
+diff --git a/Source/Server/Client/Client.cpp b/Source/Server/Client/Client.cpp
+index 54c2447b..e3057acd 100644
+--- a/Source/Server/Client/Client.cpp
++++ b/Source/Server/Client/Client.cpp
+@@ -105,7 +105,7 @@ bool Client::Init(bool InDisablePersistentData, size_t InInstanceId)
+         return false;
+     }
+ 
+-    if constexpr (BuildConfig::AUTH_ENABLED)
++    if (BuildConfig::AUTH_ENABLED)
+     {
+         //LogS(GetName().c_str(), "Requesting auth session ticket ...");
+         AppTicket.resize(2048);
+@@ -133,7 +133,7 @@ bool Client::Term()
+ {
+     //LogS(GetName().c_str(), "Terminating client ...");
+ 
+-    if constexpr (BuildConfig::AUTH_ENABLED)
++    if (BuildConfig::AUTH_ENABLED)
+     {
+         if (AppTicketHandle != k_HAuthTicketInvalid)
+         {
+diff --git a/Source/Server/Config/BuildConfig.h b/Source/Server/Config/BuildConfig.h
+index 3091524f..90a8f41d 100644
+--- a/Source/Server/Config/BuildConfig.h
++++ b/Source/Server/Config/BuildConfig.h
+@@ -47,10 +47,15 @@ public:
+         {},
+ 
+         // Dark Souls 2
++        // ds2net: widened to accept the 2015 SotFS v1.0.2.0 client (and anything
++        // else) while we identify the exact app_version value this build sends.
++        // Narrow this back down once the value is known from the server log.
+         {
+-            17039619, // We can support one version lower, but we have that disabled as we don't have RCE mitigation implemented for it.
+-            17039619,
+-            335300
++            0,
++            2147483647,
++            // ds2net: 480 (Spacewar) so a non-owned copy can auth via Steam.
++            // Set back to 335300 for a real owned copy / auth-less ZeroTier mode.
++            480
+         },
+ 
+         // Dark Souls 3
+@@ -126,7 +131,10 @@ public:
+     // When running as a client emulator this is how many clients to spawn.
+     inline static const size_t CLIENT_EMULATOR_COUNT = 2000;
+ 
+-    constexpr inline static const bool AUTH_ENABLED = true;
++    // ds2net: runtime-switchable (was constexpr) so the same binary can run with
++    // Steam ticket validation on (Spacewar/relay mode) or off (ZeroTier mode).
++    // Loaded from RuntimeConfig::EnableSteamAuth at server startup.
++    inline static bool AUTH_ENABLED = true;
+ 
+     // How long with now data gathering requests before we timeout and stop
+     // gathering data for perf.
+diff --git a/Source/Server/Config/RuntimeConfig.cpp b/Source/Server/Config/RuntimeConfig.cpp
+index 747fd1ac..8f0af6c4 100644
+--- a/Source/Server/Config/RuntimeConfig.cpp
++++ b/Source/Server/Config/RuntimeConfig.cpp
+@@ -279,6 +279,7 @@ bool RuntimeConfig::Serialize(nlohmann::json& Json, bool Loading)
+     SERIALIZE_VAR(MasterServerIp);
+     SERIALIZE_VAR(MasterServerPort);
+     SERIALIZE_VAR(Advertise);
++    SERIALIZE_VAR(EnableSteamAuth);
+     SERIALIZE_VAR(AdvertiseHearbeatTime);
+     SERIALIZE_VAR(Password);
+     SERIALIZE_VAR(ModsWhitelist);
+diff --git a/Source/Server/Config/RuntimeConfig.h b/Source/Server/Config/RuntimeConfig.h
+index 7d8344e0..b1537d13 100644
+--- a/Source/Server/Config/RuntimeConfig.h
++++ b/Source/Server/Config/RuntimeConfig.h
+@@ -169,6 +169,11 @@ public:
+     // and join it.
+     bool Advertise = true;
+ 
++    // ds2net: if true, client Steam auth tickets are validated through
++    // SteamGameServer (requires Steam to be running). Set false to run the
++    // server with no Steam dependency at all (ZeroTier/LAN mode).
++    bool EnableSteamAuth = true;
++
+     // How many seconds between each update on the master server. You should keep this
+     // as high as possible to avoid saturating the master server.
+     float AdvertiseHearbeatTime = 30.0f;
+diff --git a/Source/Server/Server/AuthService/AuthClient.cpp b/Source/Server/Server/AuthService/AuthClient.cpp
+index 697ca72e..4ba47c6f 100644
+--- a/Source/Server/Server/AuthService/AuthClient.cpp
++++ b/Source/Server/Server/AuthService/AuthClient.cpp
+@@ -242,7 +242,7 @@ bool AuthClient::Poll()
+                 sscanf(SteamId.c_str(), "%016llx", &SteamIdInt);
+                 CSteamID SteamIdStruct(SteamIdInt);                
+ 
+-                if constexpr (BuildConfig::AUTH_ENABLED)
++                if (BuildConfig::AUTH_ENABLED)
+                 {
+                     double Start = GetHighResolutionSeconds();
+ 
+diff --git a/Source/Server/Server/GameService/GameService.cpp b/Source/Server/Server/GameService/GameService.cpp
+index 7bc5e41c..75b9ec4d 100644
+--- a/Source/Server/Server/GameService/GameService.cpp
++++ b/Source/Server/Server/GameService/GameService.cpp
+@@ -245,13 +245,17 @@ void GameService::RefreshAuthToken(uint64_t AuthToken)
+     AuthStateIter->second.LastRefreshTime = GetSeconds();
+ }
+ 
++// SEAMLESS PATCH: newest connection first. A player whose game crashed logs
++// back in while the dead connection is still in the list (it lingers until its
++// retransmissions give up, about a minute), and the first match used to be that
++// dead one -- a summon pushed to a restarted player went nowhere (12.09 01:25).
+ std::shared_ptr<GameClient> GameService::FindClientByPlayerId(uint32_t PlayerId)
+ {
+-    for (std::shared_ptr<GameClient>& Client : Clients)
++    for (auto Iter = Clients.rbegin(); Iter != Clients.rend(); ++Iter)
+     {
+-        if (Client->GetPlayerState().GetPlayerId() == PlayerId)
++        if ((*Iter)->GetPlayerState().GetPlayerId() == PlayerId)
+         {
+-            return Client;
++            return *Iter;
+         }
+     }
+     return nullptr;
+@@ -259,11 +263,11 @@ std::shared_ptr<GameClient> GameService::FindClientByPlayerId(uint32_t PlayerId)
+ 
+ std::shared_ptr<GameClient> GameService::FindClientBySteamId(const std::string& SteamId)
+ {
+-    for (std::shared_ptr<GameClient>& Client : Clients)
++    for (auto Iter = Clients.rbegin(); Iter != Clients.rend(); ++Iter)
+     {
+-        if (Client->GetPlayerState().GetSteamId() == SteamId)
++        if ((*Iter)->GetPlayerState().GetSteamId() == SteamId)
+         {
+-            return Client;
++            return *Iter;
+         }
+     }
+     return nullptr;
+diff --git a/Source/Server/Server/Server.cpp b/Source/Server/Server/Server.cpp
+index f57e19a0..6bfc89ae 100644
+--- a/Source/Server/Server/Server.cpp
++++ b/Source/Server/Server/Server.cpp
+@@ -128,8 +128,16 @@ bool Server::Init()
+         return false;
+     }
+ 
++    // ds2net: apply runtime switch for Steam ticket validation before any
++    // Steam API gets touched.
++    BuildConfig::AUTH_ENABLED = Config.EnableSteamAuth;
++    if (!BuildConfig::AUTH_ENABLED)
++    {
++        Log("Steam auth is disabled by config; running without Steam.");
++    }
++
+     // Setup steam for this server.
+-    if (IsDefaultServer())
++    if (IsDefaultServer() && BuildConfig::AUTH_ENABLED)
+     {
+         std::filesystem::path appid_path = std::filesystem::current_path() / "steam_appid.txt";
+ 
+@@ -340,7 +348,7 @@ bool Server::Term()
+         return false;
+     }
+ 
+-    if (IsDefaultServer())
++    if (IsDefaultServer() && BuildConfig::AUTH_ENABLED)
+     {
+         SteamGameServer_Shutdown();
+     }
+diff --git a/Source/Server/Server/Streams/Frpg2ReliableUdpMessageStream.cpp b/Source/Server/Server/Streams/Frpg2ReliableUdpMessageStream.cpp
+index 1c4a72d8..14607d29 100644
+--- a/Source/Server/Server/Streams/Frpg2ReliableUdpMessageStream.cpp
++++ b/Source/Server/Server/Streams/Frpg2ReliableUdpMessageStream.cpp
+@@ -220,7 +220,19 @@ bool Frpg2ReliableUdpMessageStream::Receive(Frpg2ReliableUdpMessage* Message)
+         return false;
+     }
+ 
+-    if (!Message->Protobuf->ParseFromArray(Message->Payload.data(), (int)Message->Payload.size()))
++    // SEAMLESS PATCH: the DS2 client leaves out "required" fields it has no value
++    // for -- a RequestRejectSign from a sign owner resting at a bonfire came
++    // without some of its five -- and dropping the whole connection over that
++    // left the player "disconnected from the game server" until the game was
++    // reloaded. What the message does carry is taken; the rest keeps defaults.
++    bool Parsed = Message->Protobuf->ParseFromArray(Message->Payload.data(), (int)Message->Payload.size());
++    if (!Parsed && Message->Protobuf->ParsePartialFromArray(Message->Payload.data(), (int)Message->Payload.size()))
++    {
++        WarningS(Connection->GetName().c_str(), "Message type=0x%08x index=0x%08x lacks required fields -- taken with defaults.", MessageType, Message->Header.msg_index);
++        Parsed = true;
++    }
++
++    if (!Parsed)
+     {
+         WarningS(Connection->GetName().c_str(), "Failed to deserialize protobuf instance for message: type=0x%08x index=0x%08x", MessageType, Message->Header.msg_index);
+ 
+diff --git a/Source/Shared/Platform/Win32/Win32Platform.cpp b/Source/Shared/Platform/Win32/Win32Platform.cpp
+index eb30a332..fbcb3c40 100644
+--- a/Source/Shared/Platform/Win32/Win32Platform.cpp
++++ b/Source/Shared/Platform/Win32/Win32Platform.cpp
+@@ -122,6 +122,21 @@ void WriteToConsole(ConsoleColor Color, const char* Message)
+         ConsoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+     }
+ 
++    // ds2net: mirror everything to a file so the server can run headless and
++    // still be inspected.
++    static FILE* LogFile = nullptr;
++    static bool LogFileTried = false;
++    if (!LogFileTried)
++    {
++        LogFileTried = true;
++        LogFile = _fsopen("ds3os.log", "a", _SH_DENYWR);
++    }
++    if (LogFile)
++    {
++        fputs(Message, LogFile);
++        fflush(LogFile);
++    }
++
+     static WORD ColorTextAttributes[(int)ConsoleColor::Count] = {
+         12, // Red
+         14, // Yellow
+diff --git a/Source/ThirdParty/openssl/CMakeLists.txt b/Source/ThirdParty/openssl/CMakeLists.txt
+index e23b39e7..2126e73b 100644
+--- a/Source/ThirdParty/openssl/CMakeLists.txt
++++ b/Source/ThirdParty/openssl/CMakeLists.txt
+@@ -26,7 +26,7 @@
+ 
+ set( CMAKE_LEGACY_CYGWIN_WIN32 0 )
+ project( openssl )
+-cmake_minimum_required( VERSION 3.1.0 )
++cmake_minimum_required( VERSION 3.5 )
+ 
+ set( CMAKE_DISABLE_SOURCE_CHANGES ON )
+ set( CMAKE_DISABLE_IN_SOURCE_BUILD ON )
