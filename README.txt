@@ -13,6 +13,8 @@ Install:
 3. Keep Steam running and logged in. steam_appid.txt must contain 480.
 4. Launch DarkSoulsII.exe. Open the menu with F1.
 
+Barely functional, requires steam open and initialized on all machines and a service to open ur ip if u dont wanna port forward
+
 Files:
 - dinput8.dll: gameplay mod
 - ds2_seamless_coop.ini: tested settings
